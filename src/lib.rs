@@ -302,6 +302,164 @@ pub fn read_block_descriptors<R: Read + Seek + ?Sized>(
     Ok(descriptors)
 }
 
+// --- VssShadowReader: Read+Seek overlay for browsing a shadow copy ---
+
+/// Block flag: this descriptor is a forwarder (redirects to another block).
+const BLOCK_FLAG_FORWARDER: u32 = 0x01;
+/// Block flag: this descriptor is an overlay (partial block, uses bitmap).
+const BLOCK_FLAG_OVERLAY: u32 = 0x02;
+
+/// A reader that presents a shadow copy as a virtual volume.
+///
+/// Wraps a `Read+Seek` source (the current NTFS volume) and overlays
+/// changed blocks from the VSS store. When you read from an offset that
+/// was modified since the snapshot, it reads the old data from the store.
+/// Otherwise it reads from the current volume.
+///
+/// Implements `Read + Seek` so it can be passed directly to NTFS parsers.
+pub struct VssShadowReader<T: Read + Seek> {
+    source: T,
+    /// Sorted map: original_offset → (store_data_offset, flags, bitmap)
+    block_map: Vec<(u64, u64, u32, u32)>,
+    /// Current virtual position
+    position: u64,
+    /// Volume size
+    volume_size: u64,
+}
+
+impl<T: Read + Seek> VssShadowReader<T> {
+    /// Create a shadow reader for a specific shadow copy.
+    ///
+    /// `source` is the raw volume (or partition). Block descriptors are loaded
+    /// and sorted into a lookup table for fast binary search.
+    pub fn new(
+        mut source: T,
+        shadow: &VssShadowCopy,
+    ) -> Result<Self> {
+        // Read all block descriptors for this shadow copy
+        let descriptors = read_block_descriptors(&mut source, shadow.store_block_list_offset)?;
+
+        // Build sorted lookup: original_offset → (store_offset, flags, bitmap)
+        let mut block_map: Vec<(u64, u64, u32, u32)> = descriptors
+            .iter()
+            .filter(|d| d.flags & 0x04 == 0) // Skip "not used"
+            .map(|d| {
+                let data_offset = if d.flags & BLOCK_FLAG_FORWARDER != 0 {
+                    d.relative_store_offset // Forwarder: use relative offset
+                } else {
+                    d.store_data_offset // Normal: use absolute store offset
+                };
+                (d.original_offset, data_offset, d.flags, d.allocation_bitmap)
+            })
+            .collect();
+
+        block_map.sort_by_key(|&(orig, _, _, _)| orig);
+        // Deduplicate: keep last entry for each original offset (most recent write wins)
+        block_map.dedup_by_key(|entry| entry.0);
+
+        Ok(Self {
+            source,
+            block_map,
+            position: 0,
+            volume_size: shadow.volume_size,
+        })
+    }
+
+    /// Number of changed blocks in the block map.
+    pub fn block_count(&self) -> usize {
+        self.block_map.len()
+    }
+
+    /// Look up whether an offset falls within a changed block.
+    /// Returns Some((store_data_offset, flags, bitmap)) if changed.
+    fn lookup_block(&self, offset: u64) -> Option<&(u64, u64, u32, u32)> {
+        let block_start = offset & !0x3FFF; // Align to 16KB boundary
+        match self.block_map.binary_search_by_key(&block_start, |&(orig, _, _, _)| orig) {
+            Ok(idx) => Some(&self.block_map[idx]),
+            Err(_) => None,
+        }
+    }
+}
+
+impl<T: Read + Seek> Read for VssShadowReader<T> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.position >= self.volume_size {
+            return Ok(0);
+        }
+
+        let to_read = buf.len().min((self.volume_size - self.position) as usize);
+        let mut total_read = 0;
+
+        while total_read < to_read {
+            let current_pos = self.position + total_read as u64;
+            let block_start = current_pos & !0x3FFF;
+            let offset_in_block = (current_pos - block_start) as usize;
+            let remaining_in_block = BLOCK_SIZE as usize - offset_in_block;
+            let chunk_size = remaining_in_block.min(to_read - total_read);
+
+            if let Some(&(_, store_offset, flags, bitmap)) = self.lookup_block(current_pos) {
+                if flags & BLOCK_FLAG_OVERLAY != 0 {
+                    // Overlay block: check bitmap for each 512-byte sector
+                    // Read sector-by-sector, mixing store data and current volume data
+                    let sector_start = offset_in_block / 512;
+                    let mut sector_offset = 0usize;
+
+                    for sector in sector_start.. {
+                        if sector_offset >= chunk_size || sector >= 32 {
+                            break;
+                        }
+                        let sector_size = 512usize.min(chunk_size - sector_offset);
+                        let bit = (bitmap >> sector) & 1;
+
+                        if bit == 1 {
+                            // This sector has store data
+                            let read_offset = store_offset + (sector as u64 * 512);
+                            self.source.seek(SeekFrom::Start(read_offset))?;
+                            self.source.read_exact(
+                                &mut buf[total_read + sector_offset..total_read + sector_offset + sector_size]
+                            )?;
+                        } else {
+                            // This sector uses current volume data
+                            let read_offset = block_start + (sector as u64 * 512);
+                            self.source.seek(SeekFrom::Start(read_offset))?;
+                            self.source.read_exact(
+                                &mut buf[total_read + sector_offset..total_read + sector_offset + sector_size]
+                            )?;
+                        }
+                        sector_offset += sector_size;
+                    }
+                    total_read += chunk_size;
+                } else {
+                    // Normal changed block: read from store
+                    let read_offset = store_offset + offset_in_block as u64;
+                    self.source.seek(SeekFrom::Start(read_offset))?;
+                    self.source.read_exact(&mut buf[total_read..total_read + chunk_size])?;
+                    total_read += chunk_size;
+                }
+            } else {
+                // Unchanged block: read from current volume
+                self.source.seek(SeekFrom::Start(current_pos))?;
+                self.source.read_exact(&mut buf[total_read..total_read + chunk_size])?;
+                total_read += chunk_size;
+            }
+        }
+
+        self.position += total_read as u64;
+        Ok(total_read)
+    }
+}
+
+impl<T: Read + Seek> Seek for VssShadowReader<T> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.position = match pos {
+            SeekFrom::Start(p) => p,
+            SeekFrom::Current(p) => (self.position as i64 + p) as u64,
+            SeekFrom::End(p) => (self.volume_size as i64 + p) as u64,
+        };
+        Ok(self.position)
+    }
+}
+
 // --- Internal types ---
 
 struct Type02Entry {
