@@ -1,0 +1,11 @@
+[package]
+name = "vshadow-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust parser for Windows Volume Shadow Snapshot (VSS) format"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
